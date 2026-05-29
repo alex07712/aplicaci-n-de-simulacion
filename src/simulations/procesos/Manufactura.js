@@ -1,122 +1,173 @@
-/**
- * PROCESO PREDEFINIDO: MANUFACTURA
- * Línea de montaje con 3-5 estaciones en serie
- * 
- * Ejemplo: Línea de producción de autos, cadena de empaquetado, etc.
- */
-
 import { Simulation } from '../base/Simulation.js';
 import { Queue } from '../base/Queue.js';
-import { distribucionNormal } from '../../utils/estadisticas.js';
+import { distribucionExponencial, distribucionNormal } from '../../utils/estadisticas.js';
 
 export class ManufacturaProcess extends Simulation {
   constructor(config) {
-    super('Manufactura - Línea de Montaje');
-    
-    // Parámetros
-    this.tiempoLlegadaUnidades = config.tiempoLlegadaUnidades || 5; // minutos
-    this.numEstaciones = config.numEstaciones || 3; // 3, 4 o 5 estaciones
-    
-    // Crear estaciones
-    this.estaciones = [];
-    for (let i = 0; i < this.numEstaciones; i++) {
-      this.estaciones.push(new Queue(`Estación ${i + 1}`, 1));
+    super('Línea de Producción');
+    this.tiempoLlegadaBase = config.tiempoLlegada || 5;
+    this.numEstaciones = config.numEstaciones || 3;
+    this.numTrabajadoresPorEstacion = config.numTrabajadoresPorEstacion || Array(this.numEstaciones).fill(1);
+    this.tiemposEstacion = config.tiemposEstacion || [];
+    if (this.tiemposEstacion.length === 0) {
+      for (let i = 0; i < this.numEstaciones; i++) this.tiemposEstacion.push({ media: 4, desviacion: 1 });
     }
+    this.tamanioLote = 1;  // Sin lotes
+    this.capacidadProduccionMaxima = config.capacidadProduccionMaxima || null;
+    this.capacidadAlmacen = config.capacidadAlmacen || null;
+    this.fallasActivo = config.fallasActivo || false;
+    this.probabilidadFalla = config.probabilidadFalla || Array(this.numEstaciones).fill(0);
+    this.tiempoReparacion = config.tiempoReparacion || Array(this.numEstaciones).fill(10);
+    this.defectosActivo = config.defectosActivo || false;
+    this.probabilidadDefecto = config.probabilidadDefecto || Array(this.numEstaciones).fill(0);
+    this.reprocesarDefectuosos = config.reprocesarDefectuosos || false;
+    // Forzar horas pico a vacío e ignorar
+    this.horasPico = [];
+    this.estaciones = [];
+    for (let i = 0; i < this.numEstaciones; i++) this.estaciones.push(new Queue(`Estación ${i + 1}`, 1));
+    this.unidadesProducidas = 0;
+    this.unidadesDefectuosas = 0;
+    this.unidadesReprocesadas = 0;
+    this.unidadesPerdidasPorAlmacen = 0;
+    this.fallasRegistradas = Array(this.numEstaciones).fill(0);
+    this.tiempoMuertoPorFalla = Array(this.numEstaciones).fill(0);
+  }
 
-    // Parámetros de tiempo por estación (media, desviación)
-    this.tiemposEstacion = config.tiemposEstacion || [
-      { media: 4, desviacion: 1 },   // Estación 1
-      { media: 5, desviacion: 1.5 }, // Estación 2
-      { media: 3, desviacion: 0.8 }, // Estación 3
-    ];
+  obtenerFactorHoraPico() {
+    // Siempre devuelve 1.0 para ignorar horas pico
+    return 1.0;
+  }
+
+  obtenerTiempoEntreLlegadas() {
+    return this.tiempoLlegadaBase / this.obtenerFactorHoraPico();
   }
 
   inicializar() {
     this.estaciones.forEach(e => e.limpiar());
-    
-    // Programar primera unidad
-    this.programarEvento(this.tiempoLlegadaUnidades, this.llegadaUnidad.bind(this));
+    this.unidadesProducidas = 0;
+    this.unidadesDefectuosas = 0;
+    this.unidadesReprocesadas = 0;
+    this.unidadesPerdidasPorAlmacen = 0;
+    this.fallasRegistradas.fill(0);
+    this.tiempoMuertoPorFalla.fill(0);
+    this.programarProximaLlegada();
   }
 
-  /**
-   * Evento: llegada de unidad a la línea
-   */
-  llegadaUnidad(sim, datos) {
-    const unidadID = this.estaciones[0].clientesLlegados + 1;
-    const unidad = { 
-      id: unidadID, 
+  programarProximaLlegada() {
+    const tiempo = this.obtenerTiempoEntreLlegadas();
+    this.programarEvento(this.tiempoActual + tiempo, this.llegadaUnidad.bind(this));
+  }
+
+  llegadaUnidad() {
+    if (this.capacidadProduccionMaxima !== null && this.unidadesProducidas >= this.capacidadProduccionMaxima) return;
+    const unidadId = this.estaciones[0].clientesLlegados + 1;
+    const unidad = {
+      id: unidadId,
       tiempoLlegada: this.tiempoActual,
-      estacionesCompletadas: 0
+      estacionActual: 0,
+      defectuosa: false
     };
-
-    // Enviar a primera estación
-    this.enviarEstacion(unidad, 0);
-
-    // Programar próxima llegada
-    this.programarEvento(
-      this.tiempoActual + this.tiempoLlegadaUnidades,
-      this.llegadaUnidad.bind(this)
-    );
+    this.enviarUnidadPrimeraEstacion(unidad);
+    this.programarProximaLlegada();
   }
 
-  /**
-   * Enviar unidad a una estación
-   */
-  enviarEstacion(unidad, indexEstacion) {
-    if (indexEstacion >= this.numEstaciones) {
-      // Unidad completó todas las estaciones
+  enviarUnidadPrimeraEstacion(unidad) {
+    const estacion = this.estaciones[0];
+    if (this.capacidadAlmacen !== null && estacion.entidadesEnEspera.length >= this.capacidadAlmacen) {
+      this.unidadesPerdidasPorAlmacen++;
       return;
     }
-
-    const estacion = this.estaciones[indexEstacion];
     estacion.llegarEntidad(unidad, this.tiempoActual);
-
-    // Si fue atendida inmediatamente, programar fin
     if (unidad.tiempoInicio === this.tiempoActual) {
-      this.programarFinEstacion(unidad, indexEstacion);
+      this.procesarUnidad(unidad, 0);
     }
   }
 
-  /**
-   * Programar fin de procesamiento en estación
-   */
-  programarFinEstacion(unidad, indexEstacion) {
-    const config = this.tiemposEstacion[indexEstacion] || 
-                   { media: 4, desviacion: 1 };
-    
-    const tiempoServicio = distribucionNormal(config.media, config.desviacion);
-    const tiempoServicioPositivo = Math.max(0.5, tiempoServicio); // Mínimo 0.5 min
+  procesarUnidad(unidad, idxEstacion) {
+    const estacion = this.estaciones[idxEstacion];
+    const cfg = this.tiemposEstacion[idxEstacion];
+    let tiempoBase = distribucionNormal(cfg.media, cfg.desviacion);
+    tiempoBase = Math.max(0.5, tiempoBase);
+    const trabajadores = this.numTrabajadoresPorEstacion[idxEstacion] || 1;
+    const tiempoServicio = tiempoBase / trabajadores;
 
-    this.programarEvento(
-      this.tiempoActual + tiempoServicioPositivo,
-      this.finEstacion.bind(this),
-      { unidad, indexEstacion, tiempoServicio: tiempoServicioPositivo }
-    );
+    if (this.fallasActivo && Math.random() < this.probabilidadFalla[idxEstacion]) {
+      const duracionReparacion = distribucionExponencial(1 / this.tiempoReparacion[idxEstacion]);
+      this.fallasRegistradas[idxEstacion]++;
+      this.tiempoMuertoPorFalla[idxEstacion] += duracionReparacion;
+      this.programarEvento(this.tiempoActual + duracionReparacion, this.reanudarServicio.bind(this), { unidad, idxEstacion, tiempoServicio });
+      return;
+    }
+    this.programarEvento(this.tiempoActual + tiempoServicio, this.finProcesamiento.bind(this), { unidad, idxEstacion, tiempoServicio });
   }
 
-  /**
-   * Evento: fin de procesamiento en estación
-   */
-  finEstacion(sim, datos) {
-    const { unidad, indexEstacion, tiempoServicio } = datos;
-    const estacion = this.estaciones[indexEstacion];
+  reanudarServicio(sim, datos) {
+    const { unidad, idxEstacion, tiempoServicio } = datos;
+    this.programarEvento(this.tiempoActual + tiempoServicio, this.finProcesamiento.bind(this), { unidad, idxEstacion, tiempoServicio });
+  }
 
-    const proximaUnidad = estacion.liberarServidor(unidad, tiempoServicio, this.tiempoActual);
-
-    // Si hay otra unidad esperando en esta estación
-    if (proximaUnidad) {
-      this.programarFinEstacion(proximaUnidad, indexEstacion);
+  finProcesamiento(sim, datos) {
+    const { unidad, idxEstacion, tiempoServicio } = datos;
+    const estacion = this.estaciones[idxEstacion];
+    let esDefectuosa = false;
+    if (this.defectosActivo && Math.random() < this.probabilidadDefecto[idxEstacion]) {
+      esDefectuosa = true;
+      this.unidadesDefectuosas++;
     }
+    unidad.defectuosa = esDefectuosa;
 
-    // Enviar unidad a próxima estación
-    unidad.estacionesCompletadas++;
-    this.enviarEstacion(unidad, indexEstacion + 1);
+    const siguienteUnidad = estacion.liberarServidor(unidad, tiempoServicio, this.tiempoActual);
+    if (siguienteUnidad) this.procesarUnidad(siguienteUnidad, idxEstacion);
+
+    const esUltimaEstacion = (idxEstacion + 1 >= this.numEstaciones);
+    if (esUltimaEstacion && !esDefectuosa) {
+      this.unidadesProducidas++;
+    } else if (!esUltimaEstacion && !esDefectuosa) {
+      const nuevaUnidad = { ...unidad, estacionActual: idxEstacion + 1, tiempoLlegada: this.tiempoActual };
+      const siguienteEstacion = this.estaciones[idxEstacion + 1];
+      if (this.capacidadAlmacen !== null && siguienteEstacion.entidadesEnEspera.length >= this.capacidadAlmacen) {
+        this.unidadesPerdidasPorAlmacen++;
+      } else {
+        siguienteEstacion.llegarEntidad(nuevaUnidad, this.tiempoActual);
+        if (nuevaUnidad.tiempoInicio === this.tiempoActual) {
+          this.procesarUnidad(nuevaUnidad, idxEstacion + 1);
+        }
+      }
+    } else if (esDefectuosa && this.reprocesarDefectuosos) {
+      this.unidadesReprocesadas++;
+      const nuevaUnidad = { ...unidad, estacionActual: 0, tiempoLlegada: this.tiempoActual, defectuosa: false };
+      const primeraEstacion = this.estaciones[0];
+      if (this.capacidadAlmacen !== null && primeraEstacion.entidadesEnEspera.length >= this.capacidadAlmacen) {
+        this.unidadesPerdidasPorAlmacen++;
+      } else {
+        primeraEstacion.llegarEntidad(nuevaUnidad, this.tiempoActual);
+        if (nuevaUnidad.tiempoInicio === this.tiempoActual) {
+          this.procesarUnidad(nuevaUnidad, 0);
+        }
+      }
+    }
   }
 
   finalizarSimulacion() {
-    this.estadisticas = this.estaciones.map((e, i) => ({
-      nombre: `Estación ${i + 1}`,
-      ...e.obtenerEstadisticas()
+    const statsEstaciones = this.estaciones.map((e, i) => ({
+      nombre: `Estación ${i+1}`,
+      ...e.obtenerEstadisticas(this.tiempoFinal),
+      fallas: this.fallasRegistradas[i],
+      tiempoMuerto: this.tiempoMuertoPorFalla[i].toFixed(2),
+      trabajadores: this.numTrabajadoresPorEstacion[i]
     }));
+    this.estadisticas = {
+      estaciones: statsEstaciones,
+      totalUnidadesProducidas: this.unidadesProducidas,
+      totalUnidadesDefectuosas: this.unidadesDefectuosas,
+      totalUnidadesReprocesadas: this.unidadesReprocesadas,
+      unidadesPerdidasPorAlmacen: this.unidadesPerdidasPorAlmacen,
+      capacidadAlmacen: this.capacidadAlmacen === null ? 'sin límite' : this.capacidadAlmacen,
+      capacidadProduccionMaxima: this.capacidadProduccionMaxima === null ? 'sin límite' : this.capacidadProduccionMaxima,
+      tamanioLote: this.tamanioLote,
+      fallasActivo: this.fallasActivo,
+      defectosActivo: this.defectosActivo,
+      tiempoSimulacionMinutos: this.tiempoFinal
+    };
   }
 }
